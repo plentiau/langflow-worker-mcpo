@@ -107,8 +107,8 @@ def create_sub_app(server_name: str, server_cfg: Dict[str, Any], cors_allow_orig
                    connection_timeout, lifespan) -> FastAPI:
     """Create a sub-application for an MCP server."""
     sub_app = FastAPI(
-        title=f"{server_name}",
-        description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
+        title=f"[SERVER UNAVAILABLE] ({server_name})",
+        description=f"[SERVER UNAVAILABLE]",
         version="1.0",
         lifespan=lifespan,
     )
