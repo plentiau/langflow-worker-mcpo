@@ -323,6 +323,14 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         inputSchema = tool.inputSchema
         outputSchema = getattr(tool, "outputSchema", None)
 
+        # Ensure input_value is required if it exists in properties
+        if inputSchema and "properties" in inputSchema and "input_value" in inputSchema["properties"]:
+            required_list = inputSchema.get("required", [])
+            if "input_value" not in required_list:
+                # Create a copy of the inputSchema to avoid modifying the original
+                inputSchema = inputSchema.copy()
+                inputSchema["required"] = required_list + ["input_value"]
+
         form_model_fields = get_model_fields(
             f"{endpoint_name}_form_model",
             inputSchema.get("properties", {}),
