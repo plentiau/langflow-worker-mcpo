@@ -447,7 +447,7 @@ async def lifespan(app: FastAPI):
             logger.info("--------------------------\n")
 
             if not successful_servers:
-                logger.error("No MCP servers could be reached.")
+                logger.warning("No MCP servers could be reached.")
 
             yield
             # The AsyncExitStack will handle the graceful shutdown of all servers
