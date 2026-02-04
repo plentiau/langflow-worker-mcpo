@@ -24,9 +24,8 @@ from mcpo.utils.main import (
     get_tool_handler,
     normalize_server_type,
 )
-from mcpo.utils.main import get_model_fields, get_tool_handler
-from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
 from mcpo.utils.config_watcher import ConfigWatcher
+from mcpo.utils.headers import validate_client_header_forwarding_config
 from mcpo.utils.oauth import create_oauth_provider
 
 
@@ -86,6 +85,11 @@ def load_config(config_path: str) -> Dict[str, Any]:
         for server_name, server_cfg in mcp_servers.items():
             validate_server_config(server_name, server_cfg)
 
+            # Validate client header forwarding configuration if present
+            header_config = server_cfg.get("client_header_forwarding", {})
+            if header_config:
+                validate_client_header_forwarding_config(server_name, header_config)
+
         return config_data
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in config file {config_path}: {e}")
@@ -103,8 +107,8 @@ def create_sub_app(server_name: str, server_cfg: Dict[str, Any], cors_allow_orig
                    connection_timeout, lifespan) -> FastAPI:
     """Create a sub-application for an MCP server."""
     sub_app = FastAPI(
-        title=f"{server_name}",
-        description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
+        title=f"[SERVER UNAVAILABLE] ({server_name})",
+        description=f"[SERVER UNAVAILABLE]",
         version="1.0",
         lifespan=lifespan,
     )
@@ -147,7 +151,10 @@ def create_sub_app(server_name: str, server_cfg: Dict[str, Any], cors_allow_orig
 
     sub_app.state.api_dependency = api_dependency
     sub_app.state.connection_timeout = connection_timeout
-    
+
+    # Store client header forwarding configuration
+    sub_app.state.client_header_forwarding = server_cfg.get("client_header_forwarding", {"enabled": False})
+
     # Store OAuth configuration if present
     sub_app.state.oauth_config = server_cfg.get("oauth")
 
@@ -171,8 +178,22 @@ def mount_config_servers(main_app: FastAPI, config_data: Dict[str, Any],
 
 def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
     """Unmount specific MCP servers."""
+    active_lifespans = getattr(main_app.state, 'active_lifespans', {})
+    
     for server_name in server_names:
         mount_path = f"{path_prefix}{server_name}"
+        
+        # Clean up lifespan context if it exists
+        if server_name in active_lifespans:
+            lifespan_context = active_lifespans[server_name]
+            try:
+                # Schedule cleanup of the lifespan context
+                asyncio.create_task(lifespan_context.__aexit__(None, None, None))
+            except Exception as e:
+                logger.warning(f"Error cleaning up lifespan for {server_name}: {e}")
+            finally:
+                del active_lifespans[server_name]
+        
         # Find and remove the mount
         routes_to_remove = []
         for route in main_app.router.routes:
@@ -229,6 +250,11 @@ async def reload_config_handler(main_app: FastAPI, new_config_data: Dict[str, An
         # Add new servers and updated servers
         if servers_to_add:
             logger.info(f"Adding servers: {list(servers_to_add)}")
+            
+            # Store lifespan contexts for cleanup
+            if not hasattr(main_app.state, 'active_lifespans'):
+                main_app.state.active_lifespans = {}
+            
             for server_name in servers_to_add:
                 server_cfg = new_config_data["mcpServers"][server_name]
                 try:
@@ -237,6 +263,21 @@ async def reload_config_handler(main_app: FastAPI, new_config_data: Dict[str, An
                         strict_auth, api_dependency, connection_timeout, lifespan
                     )
                     main_app.mount(f"{path_prefix}{server_name}", sub_app)
+                    
+                    # Start the lifespan for the new sub-app
+                    lifespan_context = sub_app.router.lifespan_context(sub_app)
+                    await lifespan_context.__aenter__()
+                    
+                    # Store the context manager for cleanup later
+                    main_app.state.active_lifespans[server_name] = lifespan_context
+                    
+                    # Check if connection was successful
+                    is_connected = getattr(sub_app.state, "is_connected", False)
+                    if is_connected:
+                        logger.info(f"Successfully connected to new server: '{server_name}'")
+                    else:
+                        logger.warning(f"Failed to connect to new server: '{server_name}'")
+                        
                 except Exception as e:
                     logger.error(f"Failed to create server '{server_name}': {e}")
                     # Rollback on failure
@@ -282,6 +323,14 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         inputSchema = tool.inputSchema
         outputSchema = getattr(tool, "outputSchema", None)
 
+        # Ensure input_value is required if it exists in properties
+        if inputSchema and "properties" in inputSchema and "input_value" in inputSchema["properties"]:
+            required_list = inputSchema.get("required", [])
+            if "input_value" not in required_list:
+                # Create a copy of the inputSchema to avoid modifying the original
+                inputSchema = inputSchema.copy()
+                inputSchema["required"] = required_list + ["input_value"]
+
         form_model_fields = get_model_fields(
             f"{endpoint_name}_form_model",
             inputSchema.get("properties", {}),
@@ -298,11 +347,15 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
                 outputSchema.get("$defs", {}),
             )
 
+        # Get client header forwarding configuration from app state
+        client_header_forwarding_config = getattr(app.state, "client_header_forwarding", {"enabled": False})
+
         tool_handler = get_tool_handler(
             session,
             endpoint_name,
             form_model_fields,
             response_model_fields,
+            client_header_forwarding_config,
         )
 
         app.post(
@@ -321,7 +374,7 @@ async def lifespan(app: FastAPI):
     args = getattr(app.state, "args", [])
     args = args if isinstance(args, list) else [args]
     env = getattr(app.state, "env", {})
-    connection_timeout = getattr(app.state, "connection_timeout", 10)
+    connection_timeout = getattr(app.state, "connection_timeout", None)
     api_dependency = getattr(app.state, "api_dependency", None)
     path_prefix = getattr(app.state, "path_prefix", "/")
 
@@ -394,7 +447,7 @@ async def lifespan(app: FastAPI):
             logger.info("--------------------------\n")
 
             if not successful_servers:
-                logger.error("No MCP servers could be reached.")
+                logger.warning("No MCP servers could be reached.")
 
             yield
             # The AsyncExitStack will handle the graceful shutdown of all servers
@@ -406,7 +459,7 @@ async def lifespan(app: FastAPI):
             # Check for OAuth configuration
             oauth_config = getattr(app.state, "oauth_config", None)
             auth_provider = None
-            
+
             if oauth_config:
                 server_name = app.title
                 logger.info(f"OAuth configuration detected for server: {server_name}")
@@ -420,7 +473,7 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     logger.error(f"Failed to create OAuth provider for {server_name}: {e}")
                     raise
-            
+
             if server_type == "stdio":
                 # stdio doesn't support OAuth authentication
                 if oauth_config:
@@ -444,7 +497,7 @@ async def lifespan(app: FastAPI):
             elif server_type == "streamable-http":
                 headers = getattr(app.state, "headers", None)
                 client_context = streamablehttp_client(
-                    url=args[0], 
+                    url=args[0],
                     headers=headers,
                     auth=auth_provider,  # Pass OAuth provider if configured
                 )
