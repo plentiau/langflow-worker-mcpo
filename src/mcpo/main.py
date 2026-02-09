@@ -4,7 +4,8 @@ import logging
 import os
 import signal
 import socket
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
@@ -50,6 +51,70 @@ class GracefulShutdown:
         task.add_done_callback(self.tasks.discard)
 
 
+@dataclass
+class ServerRuntime:
+    sub_app: FastAPI
+    task: asyncio.Task
+    stop_event: asyncio.Event
+
+
+def _ensure_server_runtime_state(main_app: FastAPI) -> Dict[str, ServerRuntime]:
+    if not hasattr(main_app.state, "server_runtimes"):
+        main_app.state.server_runtimes = {}
+    return main_app.state.server_runtimes
+
+
+def _ensure_reload_lock(main_app: FastAPI) -> asyncio.Lock:
+    if not hasattr(main_app.state, "config_reload_lock"):
+        main_app.state.config_reload_lock = asyncio.Lock()
+    return main_app.state.config_reload_lock
+
+
+async def _start_sub_app_runtime(
+    server_name: str, sub_app: FastAPI, startup_timeout: Optional[float] = None
+) -> ServerRuntime:
+    started_event = asyncio.Event()
+    stop_event = asyncio.Event()
+
+    async def runner():
+        try:
+            async with sub_app.router.lifespan_context(sub_app):
+                started_event.set()
+                await stop_event.wait()
+        except Exception:
+            if not started_event.is_set():
+                started_event.set()
+            raise
+
+    task = asyncio.create_task(runner(), name=f"mcpo-lifespan-{server_name}")
+    try:
+        if startup_timeout and startup_timeout > 0:
+            await asyncio.wait_for(started_event.wait(), timeout=startup_timeout)
+        else:
+            await started_event.wait()
+    except Exception:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        raise
+
+    if task.done():
+        exc = task.exception()
+        if exc:
+            raise exc
+        raise RuntimeError(f"Lifespan runner for '{server_name}' exited unexpectedly.")
+
+    return ServerRuntime(sub_app=sub_app, task=task, stop_event=stop_event)
+
+
+async def _stop_server_runtime(server_name: str, runtime: ServerRuntime) -> None:
+    runtime.stop_event.set()
+    try:
+        await runtime.task
+    except Exception as e:
+        logger.warning(f"Error while stopping server '{server_name}': {type(e).__name__}: {e}")
+
+
 def validate_server_config(server_name: str, server_cfg: Dict[str, Any]) -> None:
     """Validate individual server configuration."""
     server_type = server_cfg.get("type")
@@ -70,25 +135,26 @@ def validate_server_config(server_name: str, server_cfg: Dict[str, Any]) -> None
         raise ValueError(f"Server '{server_name}' must have either 'command' for stdio or 'type' and 'url' for remote servers")
 
 
+def validate_config_data(config_data: Dict[str, Any]) -> None:
+    """Validate the full MCP server config payload."""
+    mcp_servers = config_data.get("mcpServers", {})
+    if not mcp_servers:
+        raise ValueError("No 'mcpServers' found in config file.")
+
+    for server_name, server_cfg in mcp_servers.items():
+        validate_server_config(server_name, server_cfg)
+
+        header_config = server_cfg.get("client_header_forwarding", {})
+        if header_config:
+            validate_client_header_forwarding_config(server_name, header_config)
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load and validate config from file."""
     try:
         with open(config_path, "r") as f:
             config_data = json.load(f)
-
-        mcp_servers = config_data.get("mcpServers", {})
-        if not mcp_servers:
-            logger.error(f"No 'mcpServers' found in config file: {config_path}")
-            raise ValueError("No 'mcpServers' found in config file.")
-
-        # Validate each server configuration
-        for server_name, server_cfg in mcp_servers.items():
-            validate_server_config(server_name, server_cfg)
-
-            # Validate client header forwarding configuration if present
-            header_config = server_cfg.get("client_header_forwarding", {})
-            if header_config:
-                validate_client_header_forwarding_config(server_name, header_config)
+        validate_config_data(config_data)
 
         return config_data
     except json.JSONDecodeError as e:
@@ -157,6 +223,7 @@ def create_sub_app(server_name: str, server_cfg: Dict[str, Any], cors_allow_orig
 
     # Store OAuth configuration if present
     sub_app.state.oauth_config = server_cfg.get("oauth")
+    sub_app.state.server_name = server_name
 
     return sub_app
 
@@ -176,23 +243,16 @@ def mount_config_servers(main_app: FastAPI, config_data: Dict[str, Any],
         main_app.mount(f"{path_prefix}{server_name}", sub_app)
 
 
-def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
+async def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
     """Unmount specific MCP servers."""
-    active_lifespans = getattr(main_app.state, 'active_lifespans', {})
+    server_runtimes = _ensure_server_runtime_state(main_app)
     
     for server_name in server_names:
         mount_path = f"{path_prefix}{server_name}"
         
-        # Clean up lifespan context if it exists
-        if server_name in active_lifespans:
-            lifespan_context = active_lifespans[server_name]
-            try:
-                # Schedule cleanup of the lifespan context
-                asyncio.create_task(lifespan_context.__aexit__(None, None, None))
-            except Exception as e:
-                logger.warning(f"Error cleaning up lifespan for {server_name}: {e}")
-            finally:
-                del active_lifespans[server_name]
+        runtime = server_runtimes.pop(server_name, None)
+        if runtime:
+            await _stop_server_runtime(server_name, runtime)
         
         # Find and remove the mount
         routes_to_remove = []
@@ -207,92 +267,72 @@ def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
 
 async def reload_config_handler(main_app: FastAPI, new_config_data: Dict[str, Any]):
     """Handle config reload by comparing and updating mounted servers."""
-    old_config_data = getattr(main_app.state, 'config_data', {})
-    backup_routes = list(main_app.router.routes)  # Backup current routes for rollback
+    async with _ensure_reload_lock(main_app):
+        validate_config_data(new_config_data)
+        old_config_data = getattr(main_app.state, "config_data", {})
 
-    try:
         old_servers = set(old_config_data.get("mcpServers", {}).keys())
         new_servers = set(new_config_data.get("mcpServers", {}).keys())
-
-        # Find servers to add, remove, and potentially update
         servers_to_add = new_servers - old_servers
         servers_to_remove = old_servers - new_servers
         servers_to_check = old_servers & new_servers
+        servers_to_update = {
+            server_name
+            for server_name in servers_to_check
+            if old_config_data["mcpServers"][server_name]
+            != new_config_data["mcpServers"][server_name]
+        }
 
-        # Get app configuration from state
-        cors_allow_origins = getattr(main_app.state, 'cors_allow_origins', ["*"])
-        api_key = getattr(main_app.state, 'api_key', None)
-        strict_auth = getattr(main_app.state, 'strict_auth', False)
-        api_dependency = getattr(main_app.state, 'api_dependency', None)
-        connection_timeout = getattr(main_app.state, 'connection_timeout', None)
-        lifespan = getattr(main_app.state, 'lifespan', None)
-        path_prefix = getattr(main_app.state, 'path_prefix', "/")
+        cors_allow_origins = getattr(main_app.state, "cors_allow_origins", ["*"])
+        api_key = getattr(main_app.state, "api_key", None)
+        strict_auth = getattr(main_app.state, "strict_auth", False)
+        api_dependency = getattr(main_app.state, "api_dependency", None)
+        connection_timeout = getattr(main_app.state, "connection_timeout", None)
+        lifespan = getattr(main_app.state, "lifespan", None)
+        path_prefix = getattr(main_app.state, "path_prefix", "/")
+        startup_timeout = (connection_timeout or 30) + 5
 
-        # Remove servers that are no longer in config
-        if servers_to_remove:
-            logger.info(f"Removing servers: {list(servers_to_remove)}")
-            unmount_servers(main_app, path_prefix, list(servers_to_remove))
+        server_runtimes = _ensure_server_runtime_state(main_app)
+        candidate_servers = sorted(servers_to_add | servers_to_update)
+        candidates: Dict[str, ServerRuntime] = {}
 
-        # Check for configuration changes in existing servers
-        servers_to_update = []
-        for server_name in servers_to_check:
-            old_cfg = old_config_data["mcpServers"][server_name]
-            new_cfg = new_config_data["mcpServers"][server_name]
-            if old_cfg != new_cfg:
-                servers_to_update.append(server_name)
-
-        # Remove and re-add updated servers
-        if servers_to_update:
-            logger.info(f"Updating servers: {servers_to_update}")
-            unmount_servers(main_app, path_prefix, servers_to_update)
-            servers_to_add.update(servers_to_update)
-
-        # Add new servers and updated servers
-        if servers_to_add:
-            logger.info(f"Adding servers: {list(servers_to_add)}")
-            
-            # Store lifespan contexts for cleanup
-            if not hasattr(main_app.state, 'active_lifespans'):
-                main_app.state.active_lifespans = {}
-            
-            for server_name in servers_to_add:
+        try:
+            for server_name in candidate_servers:
                 server_cfg = new_config_data["mcpServers"][server_name]
-                try:
-                    sub_app = create_sub_app(
-                        server_name, server_cfg, cors_allow_origins, api_key,
-                        strict_auth, api_dependency, connection_timeout, lifespan
-                    )
-                    main_app.mount(f"{path_prefix}{server_name}", sub_app)
-                    
-                    # Start the lifespan for the new sub-app
-                    lifespan_context = sub_app.router.lifespan_context(sub_app)
-                    await lifespan_context.__aenter__()
-                    
-                    # Store the context manager for cleanup later
-                    main_app.state.active_lifespans[server_name] = lifespan_context
-                    
-                    # Check if connection was successful
-                    is_connected = getattr(sub_app.state, "is_connected", False)
-                    if is_connected:
-                        logger.info(f"Successfully connected to new server: '{server_name}'")
-                    else:
-                        logger.warning(f"Failed to connect to new server: '{server_name}'")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to create server '{server_name}': {e}")
-                    # Rollback on failure
-                    main_app.router.routes = backup_routes
-                    raise
+                sub_app = create_sub_app(
+                    server_name,
+                    server_cfg,
+                    cors_allow_origins,
+                    api_key,
+                    strict_auth,
+                    api_dependency,
+                    connection_timeout,
+                    lifespan,
+                )
+                runtime = await _start_sub_app_runtime(
+                    server_name, sub_app, startup_timeout=startup_timeout
+                )
+                candidates[server_name] = runtime
+                logger.info(f"Successfully connected to new server: '{server_name}'")
+        except Exception as e:
+            for server_name, runtime in candidates.items():
+                await _stop_server_runtime(server_name, runtime)
+            logger.error(f"Error preparing config reload, keeping previous configuration: {e}")
+            raise
 
-        # Update stored config data only after successful reload
+        servers_to_unmount = sorted(servers_to_remove | servers_to_update)
+        if servers_to_unmount:
+            logger.info(f"Unmounting servers: {servers_to_unmount}")
+            await unmount_servers(main_app, path_prefix, servers_to_unmount)
+
+        for server_name in candidate_servers:
+            runtime = candidates[server_name]
+            main_app.mount(f"{path_prefix}{server_name}", runtime.sub_app)
+            server_runtimes[server_name] = runtime
+            logger.info(f"Mounted server: {server_name}")
+
         main_app.state.config_data = new_config_data
         logger.info("Config reload completed successfully")
-
-    except Exception as e:
-        logger.error(f"Error during config reload, keeping previous configuration: {e}")
-        # Ensure we're back to the original state
-        main_app.router.routes = backup_routes
-        raise
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
@@ -378,80 +418,70 @@ async def lifespan(app: FastAPI):
     api_dependency = getattr(app.state, "api_dependency", None)
     path_prefix = getattr(app.state, "path_prefix", "/")
 
-    # Get shutdown handler from app state
-    shutdown_handler = getattr(app.state, "shutdown_handler", None)
-
     is_main_app = not command and not (server_type in ["sse", "streamable-http"] and args)
 
     if is_main_app:
-        async with AsyncExitStack() as stack:
-            successful_servers = []
-            failed_servers = []
+        successful_servers = []
+        failed_servers = []
+        failed_mounts = []
+        startup_timeout = (connection_timeout or 30) + 5
+        server_runtimes = _ensure_server_runtime_state(app)
 
-            sub_lifespans = [
-                (route.app, route.app.router.lifespan_context(route.app))
+        async with _ensure_reload_lock(app):
+            mounts = [
+                route
                 for route in app.routes
                 if isinstance(route, Mount) and isinstance(route.app, FastAPI)
             ]
 
-            for sub_app, lifespan_context in sub_lifespans:
-                server_name = sub_app.title
+            for route in mounts:
+                sub_app = route.app
+                server_name = getattr(sub_app.state, "server_name", sub_app.title)
                 logger.info(f"Initiating connection for server: '{server_name}'...")
                 try:
-                    await stack.enter_async_context(lifespan_context)
-                    is_connected = getattr(sub_app.state, "is_connected", False)
-                    if is_connected:
-                        logger.info(f"Successfully connected to '{server_name}'.")
-                        successful_servers.append(server_name)
-                    else:
-                        logger.warning(
-                            f"Connection attempt for '{server_name}' finished, but status is not 'connected'."
-                        )
-                        failed_servers.append(server_name)
+                    runtime = await _start_sub_app_runtime(
+                        server_name, sub_app, startup_timeout=startup_timeout
+                    )
+                    server_runtimes[server_name] = runtime
+                    successful_servers.append(server_name)
+                    logger.info(f"Successfully connected to '{server_name}'.")
                 except Exception as e:
-                    error_class_name = type(e).__name__
-                    if error_class_name == 'ExceptionGroup' or (hasattr(e, 'exceptions') and hasattr(e, 'message')):
-                        logger.error(
-                            f"Failed to establish connection for server: '{server_name}' - Multiple errors occurred:"
-                        )
-                        # Log each individual exception from the group
-                        exceptions = getattr(e, 'exceptions', [])
-                        for idx, exc in enumerate(exceptions):
-                            logger.error(f"  Error {idx + 1}: {type(exc).__name__}: {exc}")
-                            # Also log traceback for each exception
-                            if hasattr(exc, '__traceback__'):
-                                import traceback
-                                tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-                                for line in tb_lines:
-                                    logger.debug(f"    {line.rstrip()}")
-                    else:
-                        logger.error(
-                            f"Failed to establish connection for server: '{server_name}' - {type(e).__name__}: {e}",
-                            exc_info=True
-                        )
+                    logger.error(
+                        f"Failed to establish connection for server: '{server_name}' - {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
                     failed_servers.append(server_name)
+                    failed_mounts.append((server_name, route))
 
-            logger.info("\n--- Server Startup Summary ---")
-            if successful_servers:
-                logger.info("Successfully connected to:")
-                for name in successful_servers:
-                    logger.info(f"  - {name}")
-                app.description += "\n\n- **available tools**："
-                for name in successful_servers:
-                    docs_path = urljoin(path_prefix, f"{name}/docs")
-                    app.description += f"\n    - [{name}]({docs_path})"
-            if failed_servers:
-                logger.warning("Failed to connect to:")
-                for name in failed_servers:
-                    logger.warning(f"  - {name}")
-            logger.info("--------------------------\n")
+            for server_name, route in failed_mounts:
+                with suppress(ValueError):
+                    app.router.routes.remove(route)
+                    logger.warning(f"Unmounted unavailable server: {server_name}")
 
-            if not successful_servers:
-                logger.warning("No MCP servers could be reached.")
+        logger.info("\n--- Server Startup Summary ---")
+        if successful_servers:
+            logger.info("Successfully connected to:")
+            for name in successful_servers:
+                logger.info(f"  - {name}")
+            app.description += "\n\n- **available tools**："
+            for name in successful_servers:
+                docs_path = urljoin(path_prefix, f"{name}/docs")
+                app.description += f"\n    - [{name}]({docs_path})"
+        if failed_servers:
+            logger.warning("Failed to connect to:")
+            for name in failed_servers:
+                logger.warning(f"  - {name}")
+        logger.info("--------------------------\n")
 
-            yield
-            # The AsyncExitStack will handle the graceful shutdown of all servers
-            # when the 'with' block is exited.
+        if not successful_servers:
+            logger.warning("No MCP servers could be reached.")
+
+        yield
+
+        async with _ensure_reload_lock(app):
+            for server_name, runtime in list(server_runtimes.items()):
+                await _stop_server_runtime(server_name, runtime)
+                server_runtimes.pop(server_name, None)
     else:
         # This is a sub-app's lifespan
         app.state.is_connected = False
@@ -593,6 +623,8 @@ async def run(
     # Pass shutdown handler to app state
     main_app.state.shutdown_handler = shutdown_handler
     main_app.state.path_prefix = path_prefix
+    main_app.state.server_runtimes = {}
+    main_app.state.config_reload_lock = asyncio.Lock()
 
     main_app.add_middleware(
         CORSMiddleware,
