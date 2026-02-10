@@ -6,7 +6,14 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from fastapi import FastAPI
 
-from mcpo.main import load_config, validate_server_config, reload_config_handler
+from mcpo.main import (
+    ServerRuntime,
+    lifespan,
+    load_config,
+    reload_config_handler,
+    unmount_servers,
+    validate_server_config,
+)
 
 
 def test_validate_server_config_stdio():
@@ -106,10 +113,13 @@ async def test_reload_config_handler():
 
     new_config = {"mcpServers": {"new_server": {"command": "echo", "args": ["new"]}}}
 
-    # Mock create_sub_app to avoid actually creating apps
-    with patch("mcpo.main.create_sub_app") as mock_create_sub_app:
+    with (
+        patch("mcpo.main.create_sub_app") as mock_create_sub_app,
+        patch("mcpo.main._start_sub_app_runtime", new_callable=AsyncMock) as mock_start_runtime,
+    ):
         mock_sub_app = Mock()
         mock_create_sub_app.return_value = mock_sub_app
+        mock_start_runtime.return_value = Mock(sub_app=mock_sub_app)
 
         # Mock app.mount to avoid actual mounting
         app.mount = Mock()
@@ -124,6 +134,86 @@ async def test_reload_config_handler():
 
         # Verify mount was called
         app.mount.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reload_config_handler_stops_started_candidates_on_failure():
+    app = FastAPI()
+    app.state.config_data = {"mcpServers": {}}
+    app.state.cors_allow_origins = ["*"]
+    app.state.api_key = None
+    app.state.strict_auth = False
+    app.state.api_dependency = None
+    app.state.connection_timeout = None
+    app.state.lifespan = None
+    app.state.path_prefix = "/"
+    app.mount = Mock()
+
+    new_config = {
+        "mcpServers": {
+            "server_a": {"command": "echo", "args": ["a"]},
+            "server_b": {"command": "echo", "args": ["b"]},
+        }
+    }
+
+    runtime_a = Mock(sub_app=Mock())
+
+    with (
+        patch("mcpo.main.create_sub_app") as mock_create_sub_app,
+        patch("mcpo.main._start_sub_app_runtime", new_callable=AsyncMock) as mock_start_runtime,
+        patch("mcpo.main._stop_server_runtime", new_callable=AsyncMock) as mock_stop_runtime,
+    ):
+        mock_create_sub_app.side_effect = [Mock(), Mock()]
+        mock_start_runtime.side_effect = [runtime_a, RuntimeError("connect failed")]
+
+        with pytest.raises(RuntimeError, match="connect failed"):
+            await reload_config_handler(app, new_config)
+
+        mock_stop_runtime.assert_awaited_once()
+        assert app.state.config_data == {"mcpServers": {}}
+        app.mount.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reload_config_handler_rejects_empty_servers():
+    app = FastAPI()
+    old_config = {"mcpServers": {"server_a": {"command": "echo", "args": ["a"]}}}
+    app.state.config_data = old_config
+    app.state.cors_allow_origins = ["*"]
+    app.state.api_key = None
+    app.state.strict_auth = False
+    app.state.api_dependency = None
+    app.state.connection_timeout = None
+    app.state.lifespan = None
+    app.state.path_prefix = "/"
+
+    with pytest.raises(ValueError, match="No 'mcpServers' found"):
+        await reload_config_handler(app, {"mcpServers": {}})
+
+    assert app.state.config_data == old_config
+
+
+@pytest.mark.asyncio
+async def test_unmount_servers_stops_runtime_and_removes_mount():
+    app = FastAPI()
+    sub_app = FastAPI()
+    app.mount("/server_a", sub_app)
+
+    stop_event = asyncio.Event()
+
+    async def runtime_task():
+        await stop_event.wait()
+
+    task = asyncio.create_task(runtime_task())
+    app.state.server_runtimes = {
+        "server_a": ServerRuntime(sub_app=sub_app, task=task, stop_event=stop_event)
+    }
+
+    await unmount_servers(app, "/", ["server_a"])
+
+    assert task.done()
+    assert "server_a" not in app.state.server_runtimes
+    assert not any(getattr(route, "path", None) == "/server_a" for route in app.router.routes)
 
 
 def test_config_watcher_initialization():
@@ -142,3 +232,77 @@ def test_config_watcher_initialization():
         assert watcher.reload_callback == callback
     finally:
         os.unlink(config_path)
+
+
+@pytest.mark.asyncio
+async def test_sub_app_lifespan_uses_state_server_name_for_oauth_provider():
+    sub_app = FastAPI()
+    sub_app.title = "Remote Metadata Name"
+    sub_app.state.server_name = "stable-config-key"
+    sub_app.state.server_type = "streamable-http"
+    sub_app.state.args = ["https://example.com/mcp"]
+    sub_app.state.oauth_config = {"server_url": "https://auth.example.com"}
+    sub_app.state.connection_timeout = None
+    sub_app.state.api_dependency = None
+
+    class DummyClientContext:
+        async def __aenter__(self):
+            return object(), object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class DummyClientSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return Mock()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    with (
+        patch("mcpo.main.create_oauth_provider", new_callable=AsyncMock) as mock_create_oauth_provider,
+        patch("mcpo.main.streamablehttp_client", return_value=DummyClientContext()),
+        patch("mcpo.main.ClientSession", DummyClientSession),
+        patch("mcpo.main.create_dynamic_endpoints", new_callable=AsyncMock),
+    ):
+        mock_create_oauth_provider.return_value = Mock()
+
+        async with lifespan(sub_app):
+            assert sub_app.state.is_connected
+
+        mock_create_oauth_provider.assert_awaited_once_with(
+            server_name="stable-config-key",
+            oauth_config={"server_url": "https://auth.example.com"},
+            storage_type="file",
+        )
+
+
+@pytest.mark.asyncio
+async def test_main_lifespan_reuses_existing_runtime_for_server():
+    app = FastAPI(description="test app")
+    app.state.connection_timeout = None
+    app.state.path_prefix = "/"
+    app.state.config_reload_lock = asyncio.Lock()
+
+    sub_app = FastAPI()
+    sub_app.state.server_name = "server_a"
+    app.mount("/server_a", sub_app)
+
+    stop_event = asyncio.Event()
+
+    async def runtime_task():
+        await stop_event.wait()
+
+    task = asyncio.create_task(runtime_task())
+    runtime = ServerRuntime(sub_app=sub_app, task=task, stop_event=stop_event)
+    app.state.server_runtimes = {"server_a": runtime}
+
+    with patch("mcpo.main._start_sub_app_runtime", new_callable=AsyncMock) as mock_start_runtime:
+        async with lifespan(app):
+            assert app.state.server_runtimes["server_a"] is runtime
+            mock_start_runtime.assert_not_awaited()
+
+    assert task.done()
