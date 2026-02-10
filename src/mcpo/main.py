@@ -439,9 +439,20 @@ async def lifespan(app: FastAPI):
                 server_name = getattr(sub_app.state, "server_name", sub_app.title)
                 logger.info(f"Initiating connection for server: '{server_name}'...")
                 try:
-                    runtime = await _start_sub_app_runtime(
-                        server_name, sub_app, startup_timeout=startup_timeout
-                    )
+                    existing_runtime = server_runtimes.get(server_name)
+                    if existing_runtime and not existing_runtime.task.done():
+                        if existing_runtime.sub_app is sub_app:
+                            runtime = existing_runtime
+                            logger.info(f"Reusing existing runtime for server: '{server_name}'.")
+                        else:
+                            await _stop_server_runtime(server_name, existing_runtime)
+                            runtime = await _start_sub_app_runtime(
+                                server_name, sub_app, startup_timeout=startup_timeout
+                            )
+                    else:
+                        runtime = await _start_sub_app_runtime(
+                            server_name, sub_app, startup_timeout=startup_timeout
+                        )
                     server_runtimes[server_name] = runtime
                     successful_servers.append(server_name)
                     logger.info(f"Successfully connected to '{server_name}'.")
@@ -486,28 +497,29 @@ async def lifespan(app: FastAPI):
         # This is a sub-app's lifespan
         app.state.is_connected = False
         try:
+            sub_app_server_name = getattr(app.state, "server_name", app.title)
+
             # Check for OAuth configuration
             oauth_config = getattr(app.state, "oauth_config", None)
             auth_provider = None
 
             if oauth_config:
-                server_name = app.title
-                logger.info(f"OAuth configuration detected for server: {server_name}")
+                logger.info(f"OAuth configuration detected for server: {sub_app_server_name}")
                 try:
                     auth_provider = await create_oauth_provider(
-                        server_name=server_name,
+                        server_name=sub_app_server_name,
                         oauth_config=oauth_config,
                         storage_type=oauth_config.get("storage_type", "file")
                     )
-                    logger.info(f"OAuth provider created for server: {server_name}")
+                    logger.info(f"OAuth provider created for server: {sub_app_server_name}")
                 except Exception as e:
-                    logger.error(f"Failed to create OAuth provider for {server_name}: {e}")
+                    logger.error(f"Failed to create OAuth provider for {sub_app_server_name}: {e}")
                     raise
 
             if server_type == "stdio":
                 # stdio doesn't support OAuth authentication
                 if oauth_config:
-                    logger.warning(f"OAuth not supported for stdio server type")
+                    logger.warning(f"OAuth not supported for stdio server type: {sub_app_server_name}")
                 server_params = StdioServerParameters(
                     command=command,
                     args=args,
@@ -517,7 +529,7 @@ async def lifespan(app: FastAPI):
             elif server_type == "sse":
                 # SSE doesn't support OAuth authentication currently
                 if oauth_config:
-                    logger.warning(f"OAuth not supported for SSE server type")
+                    logger.warning(f"OAuth not supported for SSE server type: {sub_app_server_name}")
                 headers = getattr(app.state, "headers", None)
                 client_context = sse_client(
                     url=args[0],
@@ -542,7 +554,10 @@ async def lifespan(app: FastAPI):
                     yield
         except Exception as e:
             # Log the full exception with traceback for debugging
-            logger.error(f"Failed to connect to MCP server '{app.title}': {type(e).__name__}: {e}", exc_info=True)
+            logger.error(
+                f"Failed to connect to MCP server '{sub_app_server_name}': {type(e).__name__}: {e}",
+                exc_info=True,
+            )
             app.state.is_connected = False
             # Re-raise the exception so it propagates to the main app's lifespan
             raise
