@@ -495,11 +495,22 @@ async def lifespan(app: FastAPI):
 
         # Schedule retry for failed mounts if enabled
         if _retry_enabled and failed_mounts:
-            asyncio.create_task(
+            app.state._mcp_retry_task = asyncio.create_task(
                 _retry_failed_mounts(app, failed_mounts, startup_timeout, _retry_backoff, _retry_max_backoff)
             )
 
         yield
+
+        # Stop retry task on shutdown
+        if _retry_enabled:
+            retry_task = getattr(app.state, "_mcp_retry_task", None)
+            if retry_task:
+                logger.info("Cancelling MCP retry loop...")
+                retry_task.cancel()
+                try:
+                    await retry_task
+                except asyncio.CancelledError:
+                    logger.info("MCP retry loop cancelled.")
 
         async with _ensure_reload_lock(app):
             for server_name, runtime in list(server_runtimes.items()):
