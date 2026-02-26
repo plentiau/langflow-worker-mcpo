@@ -246,14 +246,14 @@ def mount_config_servers(main_app: FastAPI, config_data: Dict[str, Any],
 async def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
     """Unmount specific MCP servers."""
     server_runtimes = _ensure_server_runtime_state(main_app)
-    
+
     for server_name in server_names:
         mount_path = f"{path_prefix}{server_name}"
-        
+
         runtime = server_runtimes.pop(server_name, None)
         if runtime:
             await _stop_server_runtime(server_name, runtime)
-        
+
         # Find and remove the mount
         routes_to_remove = []
         for route in main_app.router.routes:
@@ -420,6 +420,11 @@ async def lifespan(app: FastAPI):
 
     is_main_app = not command and not (server_type in ["sse", "streamable-http"] and args)
 
+    # Retry configuration - handle the case where Langflow is not up when mcpo starts
+    _retry_enabled = os.getenv("MCPO_RETRY_ENABLED", "true").lower() == "true"
+    _retry_backoff = int(os.getenv("MCPO_RETRY_BACKOFF", "5"))
+    _retry_max_backoff = int(os.getenv("MCPO_RETRY_MAX_BACKOFF", "60"))
+
     if is_main_app:
         successful_servers = []
         failed_servers = []
@@ -464,10 +469,11 @@ async def lifespan(app: FastAPI):
                     failed_servers.append(server_name)
                     failed_mounts.append((server_name, route))
 
-            for server_name, route in failed_mounts:
-                with suppress(ValueError):
-                    app.router.routes.remove(route)
-                    logger.warning(f"Unmounted unavailable server: {server_name}")
+            if not _retry_enabled:  # Don't unmount if we're going to be retrying
+                for server_name, route in failed_mounts:
+                    with suppress(ValueError):
+                        app.router.routes.remove(route)
+                        logger.warning(f"Unmounted unavailable server: {server_name}")
 
         logger.info("\n--- Server Startup Summary ---")
         if successful_servers:
@@ -486,6 +492,12 @@ async def lifespan(app: FastAPI):
 
         if not successful_servers:
             logger.warning("No MCP servers could be reached.")
+
+        # Schedule retry for failed mounts if enabled
+        if _retry_enabled and failed_mounts:
+            asyncio.create_task(
+                _retry_failed_mounts(app, failed_mounts, startup_timeout, _retry_backoff, _retry_max_backoff)
+            )
 
         yield
 
@@ -561,6 +573,38 @@ async def lifespan(app: FastAPI):
             app.state.is_connected = False
             # Re-raise the exception so it propagates to the main app's lifespan
             raise
+
+# Custom retry logic
+async def _retry_failed_mounts(app, failed_mounts, startup_timeout, backoff, max_backoff):
+    logger.info(f"Starting MCP server retry loop (backoff={backoff}s, max_backoff={max_backoff}s)")
+
+    while True:
+        await asyncio.sleep(backoff)
+        logger.info("Retrying MCP server connections...")
+        server_runtimes = _ensure_server_runtime_state(app)
+        recovered = []
+
+        async with _ensure_reload_lock(app):
+            for server_name, route in list(failed_mounts):
+                sub_app = route.app
+
+                try:
+                    runtime = await _start_sub_app_runtime(server_name, sub_app, startup_timeout=startup_timeout)
+                    server_runtimes[server_name] = runtime
+                    recovered.append((server_name, route))
+                    logger.info(f"Recovered MCP server: '{server_name}'")
+
+                except Exception as e:
+                    logger.debug(f"Retry failed for '{server_name}': {type(e).__name__}: {e}")
+
+        for item in recovered:
+            failed_mounts.remove(item)
+
+        if not failed_mounts:
+            logger.info("All MCP servers successfully recovered.")
+            return
+
+        backoff = min(backoff * 2, max_backoff)
 
 
 async def run(
