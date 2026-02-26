@@ -422,8 +422,8 @@ async def lifespan(app: FastAPI):
 
     # Retry configuration - handle the case where Langflow is not up when mcpo starts
     _retry_enabled = os.getenv("MCPO_RETRY_ENABLED", "true").lower() == "true"
-    _retry_backoff = int(os.getenv("MCPO_RETRY_BACKOFF", "5"))
-    _retry_max_backoff = int(os.getenv("MCPO_RETRY_MAX_BACKOFF", "60"))
+    _retry_backoff = max(int(os.getenv("MCPO_RETRY_BACKOFF", "5")), 1)
+    _retry_max_backoff = max(int(os.getenv("MCPO_RETRY_MAX_BACKOFF", "60")), _retry_backoff)
 
     if is_main_app:
         successful_servers = []
@@ -590,30 +590,39 @@ async def _retry_failed_mounts(app, failed_mounts, startup_timeout, backoff, max
     logger.info(f"Starting MCP server retry loop (backoff={backoff}s, max_backoff={max_backoff}s)")
 
     while True:
-        await asyncio.sleep(backoff)
-        logger.info("Retrying MCP server connections...")
-        server_runtimes = _ensure_server_runtime_state(app)
-        recovered = []
+        try:
+            await asyncio.sleep(backoff)
+            logger.info("Retrying MCP server connections...")
+            server_runtimes = _ensure_server_runtime_state(app)
+            recovered = []
 
-        async with _ensure_reload_lock(app):
             for server_name, route in list(failed_mounts):
                 sub_app = route.app
 
                 try:
-                    runtime = await _start_sub_app_runtime(server_name, sub_app, startup_timeout=startup_timeout)
-                    server_runtimes[server_name] = runtime
+                    async with _ensure_reload_lock(app):
+                        runtime = await _start_sub_app_runtime(server_name, sub_app, startup_timeout=startup_timeout)
+                        server_runtimes[server_name] = runtime
+
                     recovered.append((server_name, route))
                     logger.info(f"Recovered MCP server: '{server_name}'")
 
                 except Exception as e:
                     logger.debug(f"Retry failed for '{server_name}': {type(e).__name__}: {e}")
 
-        for item in recovered:
-            failed_mounts.remove(item)
+            for item in recovered:
+                failed_mounts.remove(item)
 
-        if not failed_mounts:
-            logger.info("All MCP servers successfully recovered.")
-            return
+            if not failed_mounts:
+                logger.info("All MCP servers successfully recovered.")
+                return
+
+        except asyncio.CancelledError:
+            logger.info("MCP server retry loop cancelled; exiting.")
+            raise
+
+        except Exception:
+            logger.warning("Unexpected error in MCP server retry loop; continuing retries.")
 
         backoff = min(backoff * 2, max_backoff)
 
