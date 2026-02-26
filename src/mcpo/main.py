@@ -420,17 +420,17 @@ async def lifespan(app: FastAPI):
 
     is_main_app = not command and not (server_type in ["sse", "streamable-http"] and args)
 
-    # Retry configuration - handle the case where Langflow is not up when mcpo starts
-    _retry_enabled = os.getenv("MCPO_RETRY_ENABLED", "true").lower() == "true"
-    _retry_backoff = max(int(os.getenv("MCPO_RETRY_BACKOFF", "5")), 1)
-    _retry_max_backoff = max(int(os.getenv("MCPO_RETRY_MAX_BACKOFF", "60")), _retry_backoff)
-
     if is_main_app:
         successful_servers = []
         failed_servers = []
         failed_mounts = []
         startup_timeout = (connection_timeout or 30) + 5
         server_runtimes = _ensure_server_runtime_state(app)
+
+        # Retry configuration - handle the case where Langflow is not up when mcpo starts
+        _retry_enabled = os.getenv("MCPO_RETRY_ENABLED", "true").lower() == "true"
+        _retry_backoff = max(int(os.getenv("MCPO_RETRY_BACKOFF", "5")), 1)
+        _retry_max_backoff = max(int(os.getenv("MCPO_RETRY_MAX_BACKOFF", "60")), _retry_backoff)
 
         async with _ensure_reload_lock(app):
             mounts = [
@@ -622,7 +622,7 @@ async def _retry_failed_mounts(app, failed_mounts, startup_timeout, backoff, max
             raise
 
         except Exception:
-            logger.warning("Unexpected error in MCP server retry loop; continuing retries.")
+            logger.warning("Unexpected error in MCP server retry loop; continuing retries.", exc_info=True)
 
         backoff = min(backoff * 2, max_backoff)
 
