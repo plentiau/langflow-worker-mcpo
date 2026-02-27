@@ -462,11 +462,22 @@ async def lifespan(app: FastAPI):
                     server_runtimes[server_name] = runtime
                     successful_servers.append(server_name)
                     logger.info(f"Successfully connected to '{server_name}'.")
+
                 except Exception as e:
-                    logger.error(
-                        f"Failed to establish connection for server: '{server_name}' - {type(e).__name__}: {e}",
-                        exc_info=True,
-                    )
+
+                    # Avoid stack traces for retryable connection errors - they'll flood the logs
+                    if _is_transient_mcp_error(e):
+                        logger.warning(
+                            f"MCP server '{sub_app_server_name}' unavailable at establish "
+                            f"(transient error: {type(e).__name__})"
+                        )
+                    else:
+                        # Log the full exception with traceback for debugging
+                        logger.error(
+                            f"Failed to establish connection for server: '{server_name}' - {type(e).__name__}: {e}",
+                            exc_info=True,
+                        )
+
                     failed_servers.append(server_name)
                     failed_mounts.append((server_name, route))
 
@@ -582,7 +593,7 @@ async def lifespan(app: FastAPI):
             # Avoid stack traces for retryable connection errors - they'll flood the logs
             if _is_transient_mcp_error(e):
                 logger.warning(
-                    f"MCP server '{sub_app_server_name}' unavailable "
+                    f"MCP server '{sub_app_server_name}' unavailable at retry "
                     f"(transient error: {type(e).__name__})"
                 )
             else:
