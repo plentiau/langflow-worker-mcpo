@@ -689,7 +689,8 @@ async def run(
 
     # Configure basic logging
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
     # Suppress HTTP request logs
@@ -812,6 +813,10 @@ async def run(
         config_watcher = ConfigWatcher(config_path, reload_callback)
         config_watcher.start()
 
+    # Reduce uvicorn noise - set the log level to the same as the main logger or higher
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").lower()
+    _uvicorn_log_level = "warning" if _log_level in ("debug", "info") else _log_level
+
     logger.info("Uvicorn server starting...")
     config = uvicorn.Config(
         app=main_app,
@@ -819,7 +824,7 @@ async def run(
         port=port,
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,
-        log_level="info",
+        log_level=_uvicorn_log_level,
     )
     server = uvicorn.Server(config)
 
