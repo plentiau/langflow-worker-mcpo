@@ -1,4 +1,5 @@
 import asyncio
+import httpx
 import json
 import logging
 import os
@@ -575,13 +576,24 @@ async def lifespan(app: FastAPI):
                     await create_dynamic_endpoints(app, api_dependency=api_dependency)
                     app.state.is_connected = True
                     yield
+
         except Exception as e:
-            # Log the full exception with traceback for debugging
-            logger.error(
-                f"Failed to connect to MCP server '{sub_app_server_name}': {type(e).__name__}: {e}",
-                exc_info=True,
-            )
+
+            # Avoid stack traces for retryable connection errors - they'll flood the logs
+            if _is_transient_mcp_error(e):
+                logger.warning(
+                    f"MCP server '{sub_app_server_name}' unavailable "
+                    f"(transient error: {type(e).__name__})"
+                )
+            else:
+                # Log the full exception with traceback for debugging
+                logger.error(
+                    f"Failed to connect to MCP server '{sub_app_server_name}': {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+
             app.state.is_connected = False
+
             # Re-raise the exception so it propagates to the main app's lifespan
             raise
 
@@ -627,6 +639,23 @@ async def _retry_failed_mounts(app, failed_mounts, startup_timeout, backoff, max
         backoff = min(backoff * 2, max_backoff)
 
 
+# Custom error catching during retries
+def _is_transient_mcp_error(exc: Exception) -> bool:
+    # Direct HTTP 503 etc.
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (502, 503, 504)
+
+    # Connection issues
+    if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, TimeoutError)):
+        return True
+
+    # ExceptionGroup (Python 3.11+), handle recursively
+    if isinstance(exc, ExceptionGroup):
+        return all(_is_transient_mcp_error(e) for e in exc.exceptions)
+
+    return False
+
+
 async def run(
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -660,7 +689,8 @@ async def run(
 
     # Configure basic logging
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
     # Suppress HTTP request logs
@@ -783,6 +813,10 @@ async def run(
         config_watcher = ConfigWatcher(config_path, reload_callback)
         config_watcher.start()
 
+    # Reduce uvicorn noise - set the log level to the same as the main logger or higher
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").lower()
+    _uvicorn_log_level = "warning" if _log_level in ("debug", "info") else _log_level
+
     logger.info("Uvicorn server starting...")
     config = uvicorn.Config(
         app=main_app,
@@ -790,7 +824,7 @@ async def run(
         port=port,
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,
-        log_level="info",
+        log_level=_uvicorn_log_level,
     )
     server = uvicorn.Server(config)
 
