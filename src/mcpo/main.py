@@ -468,7 +468,7 @@ async def lifespan(app: FastAPI):
                     # Avoid stack traces for retryable connection errors - they'll flood the logs
                     if _is_transient_mcp_error(e):
                         logger.warning(
-                            f"MCP server '{sub_app_server_name}' unavailable at establish "
+                            f"MCP server '{server_name}' unavailable at establish "
                             f"(transient error: {type(e).__name__})"
                         )
                     else:
