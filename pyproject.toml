@@ -10,6 +10,10 @@ requires-python = ">=3.11"
 dependencies = [
     "click>=8.1.8",
     "fastapi>=0.115.12",
+    # Imported directly by src/mcpo/main.py (exception handling + log filter).
+    # Was previously satisfied only transitively via mcp/fastapi; a resolution
+    # change dropped it and mcpo failed at import with ModuleNotFoundError.
+    "httpx>=0.27",
     "mcp>=1.12.4",
     "mcp[cli]>=1.12.4",
     "passlib[bcrypt]>=1.7.4",
