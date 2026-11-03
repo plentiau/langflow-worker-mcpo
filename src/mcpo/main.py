@@ -731,12 +731,13 @@ async def run(
     # Create shutdown handler
     shutdown_handler = GracefulShutdown()
 
+    # SSL settings belong to uvicorn.Config below, not FastAPI. Newer FastAPI
+    # rejects unknown keyword arguments, and mcpo died at startup with
+    # "unexpected keyword argument 'ssl_certfile'".
     main_app = FastAPI(
         title=name,
         description=description,
         version=version,
-        ssl_certfile=ssl_certfile,
-        ssl_keyfile=ssl_keyfile,
         lifespan=lifespan,
     )
 
